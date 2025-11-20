@@ -23,8 +23,8 @@
       "source": "registry",
       "dependencies": {
         "com.unity.burst": "1.8.17",
-        "com.unity.nuget.mono-cecil": "1.11.4",
         "com.unity.test-framework": "1.4.5",
+        "com.unity.nuget.mono-cecil": "1.11.4",
         "com.unity.test-framework.performance": "3.0.3"
       },
       "url": "https://packages.unity.com"
@@ -227,7 +227,7 @@
       "url": "https://packages.unity.com"
     },
     "com.unity.toolchain.linux-x86_64": {
-      "version": "2.0.10",
+      "version": "2.0.11",
       "depth": 0,
       "source": "registry",
       "dependencies": {
@@ -246,7 +246,7 @@
       }
     },
     "com.unity.visualscripting": {
-      "version": "1.9.7",
+      "version": "1.9.9",
       "depth": 0,
       "source": "registry",
       "dependencies": {
