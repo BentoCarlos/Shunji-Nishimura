@@ -5,6 +5,7 @@ using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
 
@@ -72,13 +73,25 @@ namespace FishNet.Discovery
 
         private void Start()
         {
+            if (NetworkManager.StaticCanLog(LoggingType.Common))
+                Debug.Log($"[Discovery] Start() called. automatic={automatic}, IsServer={InstanceFinder.IsServer}, IsClient={InstanceFinder.IsClient}", this);
+
             if (automatic)
             {
                 InstanceFinder.ServerManager.OnServerConnectionState += ServerConnectionStateChangedHandler;
 
                 InstanceFinder.ClientManager.OnClientConnectionState += ClientConnectionStateChangedHandler;
 
-                StartSearchingForServers();
+                // Don't start searching immediately - let the connection state handlers manage it
+                // The handlers will be called when the server/client starts, and will start search/advertising accordingly
+
+                if (NetworkManager.StaticCanLog(LoggingType.Common))
+                    Debug.Log("[Discovery] NetworkDiscovery started in automatic mode. Waiting for connection state changes.", this);
+            }
+            else
+            {
+                if (NetworkManager.StaticCanLog(LoggingType.Common))
+                    Debug.Log("[Discovery] NetworkDiscovery started but automatic=false. Manual control required.", this);
             }
         }
 
@@ -119,6 +132,9 @@ namespace FishNet.Discovery
 
         private void ServerConnectionStateChangedHandler(ServerConnectionStateArgs args)
         {
+            if (NetworkManager.StaticCanLog(LoggingType.Common))
+                Debug.Log($"[Discovery] Server connection state changed: {args.ConnectionState}", this);
+
             if (args.ConnectionState == LocalConnectionState.Starting)
             {
                 StopSearchingForServers();
@@ -139,6 +155,9 @@ namespace FishNet.Discovery
 
         private void ClientConnectionStateChangedHandler(ClientConnectionStateArgs args)
         {
+            if (NetworkManager.StaticCanLog(LoggingType.Common))
+                Debug.Log($"[Discovery] Client connection state changed: {args.ConnectionState}", this);
+
             if (args.ConnectionState == LocalConnectionState.Starting)
             {
                 StopSearchingForServers();
@@ -165,6 +184,15 @@ namespace FishNet.Discovery
                 return;
             }
 
+            // Validate secret first
+            if (string.IsNullOrEmpty(secret) || string.IsNullOrWhiteSpace(secret))
+            {
+                if (NetworkManager.StaticCanLog(LoggingType.Warning))
+                    Debug.LogWarning("✗ ERROR: Secret is null, empty, or whitespace! Cannot start server advertising.", this);
+
+                return;
+            }
+
             if (_serverUdpClient != null)
             {
                 if (NetworkManager.StaticCanLog(LoggingType.Common)) Debug.Log("Server is already being advertised.", this);
@@ -179,15 +207,25 @@ namespace FishNet.Discovery
                 return;
             }
 
-            _serverUdpClient = new UdpClient(port)
+            try
             {
-                EnableBroadcast = true,
-                MulticastLoopback = false,
-            };
+                // Bind to all interfaces (0.0.0.0) so it can receive from both localhost and broadcast
+                _serverUdpClient = new UdpClient(new IPEndPoint(IPAddress.Any, port))
+                {
+                    EnableBroadcast = true,
+                    MulticastLoopback = false,
+                };
 
-            Task.Run(AdvertiseServerAsync);
+                Task.Run(AdvertiseServerAsync);
 
-            if (NetworkManager.StaticCanLog(LoggingType.Common)) Debug.Log("Started advertising server.", this);
+                if (NetworkManager.StaticCanLog(LoggingType.Common))
+                    Debug.Log($"[Server Discovery] ✓ Started advertising on port {port} with secret '{secret}'", this);
+            }
+            catch (Exception ex)
+            {
+                if (NetworkManager.StaticCanLog(LoggingType.Warning))
+                    Debug.LogWarning($"[Server Discovery] Failed to start advertising: {ex.Message}", this);
+            }
         }
 
         /// <summary>
@@ -206,21 +244,69 @@ namespace FishNet.Discovery
 
         private async void AdvertiseServerAsync()
         {
+            if (NetworkManager.StaticCanLog(LoggingType.Common))
+            {
+                Debug.Log($"[Server Discovery] Secret length: {secret.Length} chars. Content: '{secret}'", this);
+                Debug.Log($"[Server Discovery] Server is now advertising on port {port} with secret '{secret}'", this);
+            }
+
+            int requestCount = 0;
+
             while (_serverUdpClient != null)
             {
-                await Task.Delay(TimeSpan.FromSeconds(discoveryInterval));
-
-                UdpReceiveResult result = await _serverUdpClient.ReceiveAsync();
-
-                string receivedSecret = Encoding.UTF8.GetString(result.Buffer);
-
-                if (receivedSecret == secret)
+                try
                 {
-                    byte[] okBytes = BitConverter.GetBytes(true);
+                    if (NetworkManager.StaticCanLog(LoggingType.Common))
+                        Debug.Log($"[Server Discovery] Waiting for discovery requests...", this);
 
-                    await _serverUdpClient.SendAsync(okBytes, okBytes.Length, result.RemoteEndPoint);
+                    UdpReceiveResult result = await _serverUdpClient.ReceiveAsync();
+
+                    string receivedSecret = Encoding.UTF8.GetString(result.Buffer);
+
+                    requestCount++;
+
+                    if (NetworkManager.StaticCanLog(LoggingType.Common))
+                        Debug.Log($"[Server Discovery] Request #{requestCount} from {result.RemoteEndPoint}, secret received: '{receivedSecret}'", this);
+
+                    if (receivedSecret == secret)
+                    {
+                        if (NetworkManager.StaticCanLog(LoggingType.Common))
+                            Debug.Log($"[Server Discovery] ✓ Request #{requestCount} from {result.RemoteEndPoint} - Secret MATCH! Sending response", this);
+
+                        try
+                        {
+                            byte[] okBytes = BitConverter.GetBytes(true);
+                            int sentBytes = await _serverUdpClient.SendAsync(okBytes, okBytes.Length, result.RemoteEndPoint);
+
+                            if (NetworkManager.StaticCanLog(LoggingType.Common))
+                                Debug.Log($"[Server Discovery] ✓ Sent {sentBytes} bytes response to {result.RemoteEndPoint}", this);
+                        }
+                        catch (Exception sendEx)
+                        {
+                            if (NetworkManager.StaticCanLog(LoggingType.Warning))
+                                Debug.LogWarning($"[Server Discovery] Error sending response to {result.RemoteEndPoint}: {sendEx.GetType().Name} - {sendEx.Message}", this);
+                        }
+                    }
+                    else
+                    {
+                        if (NetworkManager.StaticCanLog(LoggingType.Common))
+                            Debug.Log($"[Server Discovery] ✗ Request #{requestCount} from {result.RemoteEndPoint} - Secret MISMATCH! Expected '{secret}', got '{receivedSecret}'", this);
+                    }
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Server was stopped
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    if (NetworkManager.StaticCanLog(LoggingType.Warning))
+                        Debug.LogWarning($"[Server Discovery] Error: {ex.GetType().Name} - {ex.Message}\n{ex.StackTrace}", this);
                 }
             }
+
+            if (NetworkManager.StaticCanLog(LoggingType.Common))
+                Debug.Log("[Server Discovery] Server advertisement stopped.", this);
         }
 
         #endregion
@@ -232,6 +318,9 @@ namespace FishNet.Discovery
         /// </summary>
         public void StartSearchingForServers()
         {
+            if (NetworkManager.StaticCanLog(LoggingType.Common))
+                Debug.Log($"[Discovery] StartSearchingForServers() called. IsServer={InstanceFinder.IsServer}, IsClient={InstanceFinder.IsClient}, _clientUdpClient={(_clientUdpClient != null ? "not null" : "null")}", this);
+
             if (InstanceFinder.IsServer)
             {
                 if (NetworkManager.StaticCanLog(LoggingType.Warning)) Debug.LogWarning("Unable to start searching for servers. Server is active.", this);
@@ -253,15 +342,30 @@ namespace FishNet.Discovery
                 return;
             }
 
-            _clientUdpClient = new UdpClient()
+            try
             {
-                EnableBroadcast = true,
-                MulticastLoopback = false,
-            };
+                // Create UDP client explicitly bound to any available port on all interfaces
+                // This ensures the socket is ready to BOTH send and receive
+                IPEndPoint localEp = new IPEndPoint(IPAddress.Any, 0);
+                _clientUdpClient = new UdpClient(localEp)
+                {
+                    EnableBroadcast = true,
+                    MulticastLoopback = false,
+                };
 
-            Task.Run(SearchForServersAsync);
+                var boundEndpoint = _clientUdpClient.Client.LocalEndPoint as IPEndPoint;
+                if (NetworkManager.StaticCanLog(LoggingType.Common))
+                    Debug.Log($"[Discovery] Client socket BOUND to 0.0.0.0:{boundEndpoint?.Port} (ready to receive)", this);
 
-            if (NetworkManager.StaticCanLog(LoggingType.Common)) Debug.Log("Started searching for servers.", this);
+                Task.Run(SearchForServersAsync);
+
+                if (NetworkManager.StaticCanLog(LoggingType.Common)) Debug.Log("Started searching for servers.", this);
+            }
+            catch (Exception ex)
+            {
+                if (NetworkManager.StaticCanLog(LoggingType.Warning))
+                    Debug.LogWarning($"[Discovery] Error creating UDP client: {ex.Message}", this);
+            }
         }
 
         /// <summary>
@@ -271,7 +375,15 @@ namespace FishNet.Discovery
         {
             if (_clientUdpClient == null) return;
 
-            _clientUdpClient.Close();
+            try
+            {
+                _clientUdpClient.Close();
+            }
+            catch (Exception ex)
+            {
+                if (NetworkManager.StaticCanLog(LoggingType.Common))
+                    Debug.Log($"[Discovery] Error closing UDP client: {ex.Message}", this);
+            }
 
             _clientUdpClient = null;
 
@@ -280,25 +392,140 @@ namespace FishNet.Discovery
 
         private async void SearchForServersAsync()
         {
+            // Validate secret first
+            if (string.IsNullOrEmpty(secret) || string.IsNullOrWhiteSpace(secret))
+            {
+                if (NetworkManager.StaticCanLog(LoggingType.Warning))
+                    Debug.LogWarning($"[Discovery] ✗ ERROR: Secret is null, empty, or whitespace! Cannot search for servers.", this);
+                return;
+            }
+
             byte[] secretBytes = Encoding.UTF8.GetBytes(secret);
 
-            IPEndPoint endPoint = new IPEndPoint(IPAddress.Broadcast, port);
+            if (NetworkManager.StaticCanLog(LoggingType.Common))
+                Debug.Log($"[Discovery] Secret length: {secret.Length} chars, {secretBytes.Length} bytes. Content: '{secret}'", this);
+
+            if (secretBytes.Length < 3)
+            {
+                if (NetworkManager.StaticCanLog(LoggingType.Warning))
+                    Debug.LogWarning($"[Discovery] ✗ WARNING: Secret is very short ({secretBytes.Length} bytes)! Make sure it's configured in the Inspector.", this);
+            }
+
+            // Try both broadcast and localhost
+            IPEndPoint broadcastEndPoint = new IPEndPoint(IPAddress.Broadcast, port);
+            IPEndPoint localhostEndPoint = new IPEndPoint(IPAddress.Loopback, port);
+
+            int attemptCount = 0;
+
+            if (NetworkManager.StaticCanLog(LoggingType.Common))
+                Debug.Log($"[Discovery] Starting server discovery on port {port} with secret '{secret}' ({secretBytes.Length} bytes)", this);
 
             while (_clientUdpClient != null)
             {
-                await Task.Delay(TimeSpan.FromSeconds(discoveryInterval));
-
-                await _clientUdpClient.SendAsync(secretBytes, secretBytes.Length, endPoint);
-
-                UdpReceiveResult result = await _clientUdpClient.ReceiveAsync();
-
-                if (BitConverter.ToBoolean(result.Buffer, 0))
+                try
                 {
-                    ServerFoundCallback?.Invoke(result.RemoteEndPoint);
+                    await Task.Delay(TimeSpan.FromSeconds(discoveryInterval));
 
-                    StopSearchingForServers();
+                    attemptCount++;
+
+                    if (NetworkManager.StaticCanLog(LoggingType.Common))
+                        Debug.Log($"[Discovery] Attempt #{attemptCount} - Sending discovery requests...", this);
+
+                    // Try broadcast first
+                    try
+                    {
+                        int sentBytes = await _clientUdpClient.SendAsync(secretBytes, secretBytes.Length, broadcastEndPoint);
+                        if (NetworkManager.StaticCanLog(LoggingType.Common))
+                            Debug.Log($"[Discovery] Sent {sentBytes} bytes to broadcast", this);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (NetworkManager.StaticCanLog(LoggingType.Common))
+                            Debug.Log($"[Discovery] Broadcast send failed: {ex.Message}", this);
+                    }
+
+                    // Also try localhost (important for testing on same machine)
+                    try
+                    {
+                        int sentBytes = await _clientUdpClient.SendAsync(secretBytes, secretBytes.Length, localhostEndPoint);
+                        if (NetworkManager.StaticCanLog(LoggingType.Common))
+                            Debug.Log($"[Discovery] Sent {sentBytes} bytes to localhost", this);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (NetworkManager.StaticCanLog(LoggingType.Common))
+                            Debug.Log($"[Discovery] Localhost send failed: {ex.Message}", this);
+                    }
+
+                    // Wait for responses with proper timeout using CancellationToken
+                    float timeoutSeconds = 5f;
+                    if (NetworkManager.StaticCanLog(LoggingType.Common))
+                        Debug.Log($"[Discovery] Waiting for response (timeout: {timeoutSeconds}s)...", this);
+
+                    if (_clientUdpClient == null)
+                    {
+                        if (NetworkManager.StaticCanLog(LoggingType.Common))
+                            Debug.Log($"[Discovery] Client was closed while waiting", this);
+                        break;
+                    }
+
+                    try
+                    {
+                        using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds)))
+                        {
+                            var receiveTask = _clientUdpClient.ReceiveAsync();
+                            UdpReceiveResult result = await receiveTask;
+
+                            if (NetworkManager.StaticCanLog(LoggingType.Common))
+                                Debug.Log($"[Discovery] ✓ Received response from {result.RemoteEndPoint}, buffer: {result.Buffer.Length} bytes = {string.Join(",", result.Buffer)}", this);
+
+                            if (result.Buffer.Length > 0)
+                            {
+                                bool isValid = BitConverter.ToBoolean(result.Buffer, 0);
+                                if (NetworkManager.StaticCanLog(LoggingType.Common))
+                                    Debug.Log($"[Discovery] Response valid: {isValid}", this);
+
+                                if (isValid)
+                                {
+                                    if (NetworkManager.StaticCanLog(LoggingType.Common))
+                                        Debug.Log($"[Discovery] ✓✓✓ Found server at {result.RemoteEndPoint}", this);
+
+                                    ServerFoundCallback?.Invoke(result.RemoteEndPoint);
+                                }
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        if (NetworkManager.StaticCanLog(LoggingType.Common))
+                            Debug.Log($"[Discovery] Attempt #{attemptCount} - Timeout ({timeoutSeconds}s). No server response. Retrying...", this);
+                    }
+                    catch (ObjectDisposedException disposedEx)
+                    {
+                        if (NetworkManager.StaticCanLog(LoggingType.Common))
+                            Debug.Log($"[Discovery] Client socket was closed. Stopping search.", this);
+                        break;
+                    }
+                    catch (Exception receiveEx)
+                    {
+                        if (NetworkManager.StaticCanLog(LoggingType.Warning))
+                            Debug.LogWarning($"[Discovery] Error receiving response: {receiveEx.GetType().Name} - {receiveEx.Message}", this);
+                    }
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Client was closed, exit gracefully
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    if (NetworkManager.StaticCanLog(LoggingType.Warning))
+                        Debug.LogWarning($"[Discovery] Error: {ex.GetType().Name} - {ex.Message}\n{ex.StackTrace}", this);
                 }
             }
+
+            if (NetworkManager.StaticCanLog(LoggingType.Common))
+                Debug.Log("[Discovery] Server discovery stopped.", this);
         }
 
         #endregion
